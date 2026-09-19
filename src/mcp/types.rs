@@ -56,6 +56,19 @@ pub struct GetDailyStatsRequest {
     /// Number of most recent days to return. If omitted, returns all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+
+    /// Filter to a specific session by UUID (e.g., "046a7be9-252e-4fd6-b54b-56c74e5ebd2c").
+    /// When provided, returns stats only for the session whose JSONL filename contains this UUID.
+    /// Supersedes date and limit filters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
+    /// Filter to sessions whose conversation title contains this string (e.g., a bead ID like "vault-c2y").
+    /// When provided, returns aggregated stats across all matching sessions.
+    /// Requires tweakcc /title to have been used to set the conversation title.
+    /// Supersedes date and limit filters. Ignored if session_id is also provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bead_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -93,6 +106,18 @@ pub struct GetFileOpsRequest {
     /// Filter by analyzer name. If omitted, returns combined file operations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analyzer: Option<String>,
+
+    /// Filter to a specific session by UUID (e.g., "046a7be9-252e-4fd6-b54b-56c74e5ebd2c").
+    /// When provided, returns file ops only for the session whose JSONL filename contains this UUID.
+    /// Supersedes date filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
+    /// Filter to sessions whose conversation title contains this string (e.g., a bead ID like "vault-c2y").
+    /// When provided, returns aggregated file ops across all matching sessions.
+    /// Supersedes date filter. Ignored if session_id is also provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bead_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
