@@ -16,7 +16,7 @@ jobs:
     # If we don't do this, the job will be skipped if the matrix job fails.
     if: always()
     name: all-checks
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     needs:
       - crate_metadata
       - lint
@@ -28,7 +28,7 @@ jobs:
 
   crate_metadata:
     name: Extract crate metadata
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     steps:
       - uses: actions/checkout@v4
       - name: Extract crate information
@@ -46,7 +46,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -83,7 +83,7 @@ jobs:
 
   license_checks:
     name: License checks
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -93,7 +93,7 @@ jobs:
 
   cargo-audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
