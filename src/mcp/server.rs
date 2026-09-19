@@ -93,15 +93,25 @@ impl SplitrailMcpServer {
     /// the full path with crate::utils::hash_text. We scan the projects directory for
     /// files whose stem contains the session_id, then hash their paths to get the
     /// conversation_hash keys we can filter on.
-    fn conversation_hashes_for_session(session_id: &str) -> HashSet<String> {
-        let mut hashes = HashSet::new();
+    fn conversation_hashes_for_session(session_id: &str) -> Result<HashSet<String>, String> {
+        if session_id.is_empty() {
+            return Err("session_id must not be empty".into());
+        }
+        if session_id.len() < 8 {
+            return Err(format!(
+                "session_id too short ({}); provide a UUID or sufficient prefix to avoid matching all sessions",
+                session_id.len()
+            ));
+        }
+
         let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
         let home_dir = dirs::home_dir();
         let projects_dir = match claude_projects_dir(config_dir.as_deref(), home_dir.as_deref()) {
             Some(d) if d.is_dir() => d,
-            _ => return hashes,
+            _ => return Err("~/.claude/projects/ not found; verify Claude Code is installed and has been run at least once".into()),
         };
 
+        let mut hashes = HashSet::new();
         use walkdir::WalkDir;
         for entry in WalkDir::new(&projects_dir)
             .into_iter()
@@ -109,15 +119,24 @@ impl SplitrailMcpServer {
         {
             let path = entry.path();
             if path.is_file() {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if stem.contains(session_id) {
-                        let hash = utils::hash_text(&path.to_string_lossy());
-                        hashes.insert(hash);
-                    }
+                // Match on the full path string so subagent transcripts
+                // ({SESSION_UUID}/subagents/**/*.jsonl) are included — file_stem()
+                // only returns the leaf filename and misses the parent UUID directory.
+                if path.to_string_lossy().contains(session_id) {
+                    let hash = utils::hash_text(&path.to_string_lossy());
+                    hashes.insert(hash);
                 }
             }
         }
-        hashes
+
+        if hashes.is_empty() {
+            return Err(format!(
+                "no sessions found matching session_id {:?}; check the UUID and that the session has been recorded",
+                session_id
+            ));
+        }
+
+        Ok(hashes)
     }
 
     /// Filter messages to those belonging to sessions matching session_id or bead_id.
@@ -130,24 +149,24 @@ impl SplitrailMcpServer {
         messages: &'a [ConversationMessage],
         session_id: Option<&str>,
         bead_id: Option<&str>,
-    ) -> Vec<&'a ConversationMessage> {
+    ) -> Result<Vec<&'a ConversationMessage>, String> {
         if let Some(sid) = session_id {
-            let hashes = Self::conversation_hashes_for_session(sid);
-            messages
+            let hashes = Self::conversation_hashes_for_session(sid)?;
+            Ok(messages
                 .iter()
                 .filter(|m| hashes.contains(&m.conversation_hash))
-                .collect()
+                .collect())
         } else if let Some(bid) = bead_id {
-            messages
+            Ok(messages
                 .iter()
                 .filter(|m| {
                     m.session_name
                         .as_deref()
                         .is_some_and(|name| name.contains(bid))
                 })
-                .collect()
+                .collect())
         } else {
-            messages.iter().collect()
+            Ok(messages.iter().collect())
         }
     }
 
@@ -210,7 +229,7 @@ impl SplitrailMcpServer {
                 &all_messages,
                 req.session_id.as_deref(),
                 req.bead_id.as_deref(),
-            );
+            ).map_err(|e| e)?;
             let filtered: Vec<ConversationMessage> = filtered_refs.into_iter().cloned().collect();
             let daily_stats = utils::aggregate_by_date(&filtered);
             let file_ops_by_date = {
@@ -395,6 +414,7 @@ impl SplitrailMcpServer {
                 req.session_id.as_deref(),
                 req.bead_id.as_deref(),
             )
+            .map_err(|e| e)?
             .into_iter()
             .cloned()
             .collect()
