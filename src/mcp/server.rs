@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -13,7 +13,8 @@ use rmcp::{
     tool_router,
 };
 
-use crate::types::MultiAnalyzerStats;
+use crate::analyzers::claude_code::claude_projects_dir;
+use crate::types::{ConversationMessage, MultiAnalyzerStats};
 use crate::{create_analyzer_registry, utils};
 
 use super::types::*;
@@ -82,6 +83,93 @@ impl SplitrailMcpServer {
         file_ops_by_date
     }
 
+    /// Resolve the set of conversation_hashes that correspond to a given session UUID.
+    ///
+    /// Claude Code stores sessions at:
+    ///   ~/.claude/projects/{PROJECT_ID}/{SESSION_UUID}.jsonl
+    ///   ~/.claude/projects/{PROJECT_ID}/{SESSION_UUID}/subagents/**/*.jsonl
+    ///
+    /// The conversation_hash stored on each ConversationMessage is derived by hashing
+    /// the full path with crate::utils::hash_text. We scan the projects directory for
+    /// files whose stem contains the session_id, then hash their paths to get the
+    /// conversation_hash keys we can filter on.
+    fn conversation_hashes_for_session(session_id: &str) -> Result<HashSet<String>, String> {
+        if session_id.is_empty() {
+            return Err("session_id must not be empty".into());
+        }
+        if session_id.len() < 8 {
+            return Err(format!(
+                "session_id too short ({}); provide a UUID or sufficient prefix to avoid matching all sessions",
+                session_id.len()
+            ));
+        }
+
+        let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        let home_dir = dirs::home_dir();
+        let projects_dir = match claude_projects_dir(config_dir.as_deref(), home_dir.as_deref()) {
+            Some(d) if d.is_dir() => d,
+            _ => return Err("~/.claude/projects/ not found; verify Claude Code is installed and has been run at least once".into()),
+        };
+
+        let mut hashes = HashSet::new();
+        use walkdir::WalkDir;
+        for entry in WalkDir::new(&projects_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.is_file() {
+                // Match on the full path string so subagent transcripts
+                // ({SESSION_UUID}/subagents/**/*.jsonl) are included — file_stem()
+                // only returns the leaf filename and misses the parent UUID directory.
+                if path.to_string_lossy().contains(session_id) {
+                    let hash = utils::hash_text(&path.to_string_lossy());
+                    hashes.insert(hash);
+                }
+            }
+        }
+
+        if hashes.is_empty() {
+            return Err(format!(
+                "no sessions found matching session_id {:?}; check the UUID and that the session has been recorded",
+                session_id
+            ));
+        }
+
+        Ok(hashes)
+    }
+
+    /// Filter messages to those belonging to sessions matching session_id or bead_id.
+    ///
+    /// - session_id: matches JSONL files whose stem contains the UUID string
+    /// - bead_id: matches messages where session_name contains the bead_id string
+    /// - If session_id is provided it takes precedence over bead_id.
+    /// - If neither is provided, all messages are returned unchanged.
+    fn filter_messages_by_session<'a>(
+        messages: &'a [ConversationMessage],
+        session_id: Option<&str>,
+        bead_id: Option<&str>,
+    ) -> Result<Vec<&'a ConversationMessage>, String> {
+        if let Some(sid) = session_id {
+            let hashes = Self::conversation_hashes_for_session(sid)?;
+            Ok(messages
+                .iter()
+                .filter(|m| hashes.contains(&m.conversation_hash))
+                .collect())
+        } else if let Some(bid) = bead_id {
+            Ok(messages
+                .iter()
+                .filter(|m| {
+                    m.session_name
+                        .as_deref()
+                        .is_some_and(|name| name.contains(bid))
+                })
+                .collect())
+        } else {
+            Ok(messages.iter().collect())
+        }
+    }
+
     /// Get daily stats for a specific analyzer or combined across all
     fn get_daily_stats_for_analyzer(
         stats: &MultiAnalyzerStats,
@@ -114,13 +202,63 @@ impl SplitrailMcpServer {
 impl SplitrailMcpServer {
     #[tool(
         name = "get_daily_stats",
-        description = "Get daily usage statistics including messages, costs, tokens, and file operations. Can filter by date, analyzer, or limit to recent days."
+        description = "Get daily usage statistics including messages, costs, tokens, and file operations. Can filter by date, analyzer, limit to recent days, or scope to a specific session_id or bead_id."
     )]
     async fn get_daily_stats(
         &self,
         Parameters(req): Parameters<GetDailyStatsRequest>,
     ) -> Result<Json<DailyStatsResponse>, String> {
         let stats = self.load_stats().map_err(|e| e.to_string())?;
+
+        // When session_id or bead_id is provided, filter raw messages and re-aggregate.
+        // The date and limit filters are not applied in this path.
+        if req.session_id.is_some() || req.bead_id.is_some() {
+            let all_messages: Vec<ConversationMessage> = stats
+                .analyzer_stats
+                .iter()
+                .filter(|a| {
+                    req.analyzer
+                        .as_deref()
+                        .map(|name| a.analyzer_name.eq_ignore_ascii_case(name))
+                        .unwrap_or(true)
+                })
+                .flat_map(|a| a.messages.iter().cloned())
+                .collect();
+
+            let filtered_refs = Self::filter_messages_by_session(
+                &all_messages,
+                req.session_id.as_deref(),
+                req.bead_id.as_deref(),
+            ).map_err(|e| e)?;
+            let filtered: Vec<ConversationMessage> = filtered_refs.into_iter().cloned().collect();
+            let daily_stats = utils::aggregate_by_date(&filtered);
+            let file_ops_by_date = {
+                let mut map: HashMap<String, DateFileOps> = HashMap::new();
+                for msg in &filtered {
+                    let date = msg
+                        .date
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d")
+                        .to_string();
+                    let entry = map.entry(date).or_default();
+                    entry.files_read += msg.stats.files_read;
+                    entry.files_edited += msg.stats.files_edited;
+                    entry.files_added += msg.stats.files_added;
+                    entry.terminal_commands += msg.stats.terminal_commands;
+                }
+                map
+            };
+            let mut results: Vec<DailySummary> = daily_stats
+                .iter()
+                .map(|(date, ds)| {
+                    let file_ops = file_ops_by_date.get(date).cloned().unwrap_or_default();
+                    DailySummary::new(date.as_str(), ds, &file_ops)
+                })
+                .collect();
+            results.sort_by(|a, b| b.date.cmp(&a.date));
+            return Ok(Json(DailyStatsResponse { results }));
+        }
+
         let daily_stats = Self::get_daily_stats_for_analyzer(&stats, req.analyzer.as_deref());
         let file_ops_by_date = Self::compute_file_ops_by_date(&stats, req.analyzer.as_deref());
 
@@ -243,7 +381,7 @@ impl SplitrailMcpServer {
 
     #[tool(
         name = "get_file_operations",
-        description = "Get file operation statistics including reads, writes, edits, and terminal commands."
+        description = "Get file operation statistics including reads, writes, edits, and terminal commands. Can filter by date, analyzer, session_id, or bead_id."
     )]
     async fn get_file_operations(
         &self,
@@ -252,25 +390,42 @@ impl SplitrailMcpServer {
         let stats = self.load_stats().map_err(|e| e.to_string())?;
 
         // Collect messages, optionally filtered by analyzer
-        let messages: Vec<_> = if let Some(ref analyzer_name) = req.analyzer {
+        let all_messages: Vec<ConversationMessage> = if let Some(ref analyzer_name) = req.analyzer {
             stats
                 .analyzer_stats
                 .iter()
                 .filter(|a| a.analyzer_name.eq_ignore_ascii_case(analyzer_name))
-                .flat_map(|a| a.messages.iter())
+                .flat_map(|a| a.messages.iter().cloned())
                 .collect()
         } else {
             stats
                 .analyzer_stats
                 .iter()
-                .flat_map(|a| a.messages.iter())
+                .flat_map(|a| a.messages.iter().cloned())
                 .collect()
         };
 
+        // Apply session_id or bead_id filter first, then date filter
+        let session_filtered: Vec<ConversationMessage> = if req.session_id.is_some()
+            || req.bead_id.is_some()
+        {
+            Self::filter_messages_by_session(
+                &all_messages,
+                req.session_id.as_deref(),
+                req.bead_id.as_deref(),
+            )
+            .map_err(|e| e)?
+            .into_iter()
+            .cloned()
+            .collect()
+        } else {
+            all_messages
+        };
+
         // Filter by date if specified
-        let filtered: Vec<_> = if let Some(ref date) = req.date {
-            messages
-                .into_iter()
+        let filtered: Vec<&ConversationMessage> = if let Some(ref date) = req.date {
+            session_filtered
+                .iter()
                 .filter(|m| {
                     m.date
                         .with_timezone(&chrono::Local)
@@ -280,7 +435,7 @@ impl SplitrailMcpServer {
                 })
                 .collect()
         } else {
-            messages
+            session_filtered.iter().collect()
         };
 
         // Sum file operations from raw Stats
